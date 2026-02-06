@@ -24,15 +24,6 @@ MANDATORY_CHANNELS = [
     "@Click_To_Earn_By_Nobab_Channel"
 ]
 
-# ==================================================
-
-bot = Bot("8508138633:AAE6NRVSAXXrkzFCA8DLRJb389xroV2HqCA", parse_mode=ParseMode.HTML)
-dp = Dispatcher()
-router = Router()
-dp.include_router(router)
-
-# ================= DATABASE =================
-
 db = sqlite3.connect("bot.db")
 cursor = db.cursor()
 
