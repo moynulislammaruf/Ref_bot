@@ -3,35 +3,33 @@ import asyncio
 import random
 import sqlite3
 
-from aiogram import Bot, Dispatcher, Router
-from aiogram.types import Message, CallbackQuery
-from aiogram.filters import Command
+from aiogram import Bot, Dispatcher, Router, types
 from aiogram.enums import ParseMode
+from aiogram.client.bot import DefaultBotProperties
+from aiogram.filters import Command
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 # ================= ENV CONFIG =================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
-    raise Exception("BOT_TOKEN is missing")
+    raise Exception("BOT_TOKEN missing")
 
-# Admin ID (comma separated হলে split করে নিতে পারো)
-ADMIN_IDS = [5988572342]  # নিজের Telegram numeric ID বসাও
+ADMIN_IDS = [5988572342]  # নিজের Telegram ID বসাও
 
-# Bot settings
 TOKEN_NAME = "STAR"
 REFERRAL_REWARD = 1.0
 MIN_WITHDRAW = 10.0
 WITHDRAW_TAX_PERCENT = 5
 
-MANDATORY_CHANNELS = [
-    "@cryptomininginformer",
-    "@Click_To_Earn_By_Nobab_Channel"
-]
+MANDATORY_CHANNELS = ["@cryptomininginformer", "@Click_To_Earn_By_Nobab_Channel"]
 
 # ================= BOT INIT =================
 
-bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
+bot = Bot(
+    token=BOT_TOKEN,
+    default=types.DefaultBotProperties(parse_mode=ParseMode.HTML)
+)
 dp = Dispatcher()
 router = Router()
 dp.include_router(router)
@@ -105,7 +103,7 @@ def generate_captcha():
 # ================= START =================
 
 @router.message(Command("start"))
-async def start(msg: Message):
+async def start(msg: types.Message):
     args = msg.text.split()
     ref_by = int(args[1]) if len(args) > 1 and args[1].isdigit() else None
 
@@ -134,7 +132,7 @@ async def start(msg: Message):
 # ================= VERIFY =================
 
 @router.callback_query(lambda c: c.data == "verify")
-async def verify(call: CallbackQuery):
+async def verify(call: types.CallbackQuery):
     if not await check_channels(call.from_user.id):
         await call.answer("❌ সব চ্যানেল Join করো", show_alert=True)
         return
@@ -152,7 +150,7 @@ async def verify(call: CallbackQuery):
 # ================= CAPTCHA ANSWER =================
 
 @router.message()
-async def captcha_handler(msg: Message):
+async def captcha_handler(msg: types.Message):
     cursor.execute(
         "SELECT captcha_answer, ref_by FROM users WHERE user_id=?",
         (msg.from_user.id,)
@@ -185,7 +183,6 @@ async def captcha_handler(msg: Message):
                 pass
 
         db.commit()
-
         await msg.answer("✅ Verification Complete!", reply_markup=main_menu())
     else:
         await msg.answer("❌ ভুল উত্তর, আবার চেষ্টা করো")
@@ -193,7 +190,7 @@ async def captcha_handler(msg: Message):
 # ================= BALANCE =================
 
 @router.callback_query(lambda c: c.data == "balance")
-async def balance(call: CallbackQuery):
+async def balance(call: types.CallbackQuery):
     cursor.execute("SELECT balance FROM users WHERE user_id=?", (call.from_user.id,))
     bal = cursor.fetchone()[0]
 
@@ -203,8 +200,8 @@ async def balance(call: CallbackQuery):
 # ================= REFER LINK =================
 
 @router.callback_query(lambda c: c.data == "refer")
-async def refer(call: CallbackQuery):
-    me = await bot.me()
+async def refer(call: types.CallbackQuery):
+    me = await bot.get_me()
     link = f"https://t.me/{me.username}?start={call.from_user.id}"
     await call.message.answer(f"🔗 <b>Your Referral Link</b>\n<code>{link}</code>")
     await call.answer()
@@ -212,7 +209,7 @@ async def refer(call: CallbackQuery):
 # ================= WITHDRAW =================
 
 @router.callback_query(lambda c: c.data == "withdraw")
-async def withdraw(call: CallbackQuery):
+async def withdraw(call: types.CallbackQuery):
     cursor.execute("SELECT balance FROM users WHERE user_id=?", (call.from_user.id,))
     bal = cursor.fetchone()[0]
 
