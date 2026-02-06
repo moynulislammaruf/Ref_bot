@@ -4,13 +4,10 @@ import random
 import sqlite3
 
 from aiogram import Bot, Dispatcher, Router, types
-from aiogram.enums import ParseMode
-from aiogram.client.bot import DefaultBotProperties
 from aiogram.filters import Command
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 # ================= ENV CONFIG =================
-
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise Exception("BOT_TOKEN missing")
@@ -25,17 +22,13 @@ WITHDRAW_TAX_PERCENT = 5
 MANDATORY_CHANNELS = ["@cryptomininginformer", "@Click_To_Earn_By_Nobab_Channel"]
 
 # ================= BOT INIT =================
-
-bot = Bot(
-    token=BOT_TOKEN,
-    default=types.DefaultBotProperties(parse_mode=ParseMode.HTML)
-)
+# parse_mode v3.7+ এ সরাসরি Bot initializer এ দেওয়া যাবে না
+bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 router = Router()
 dp.include_router(router)
 
 # ================= DATABASE =================
-
 db = sqlite3.connect("bot.db")
 cursor = db.cursor()
 
@@ -69,7 +62,6 @@ CREATE TABLE IF NOT EXISTS withdrawals (
 db.commit()
 
 # ================= KEYBOARDS =================
-
 def verify_keyboard():
     kb = InlineKeyboardBuilder()
     kb.button(text="✅ Verify Join", callback_data="verify")
@@ -84,7 +76,6 @@ def main_menu():
     return kb.as_markup()
 
 # ================= UTILITIES =================
-
 async def check_channels(user_id: int) -> bool:
     for ch in MANDATORY_CHANNELS:
         try:
@@ -101,7 +92,6 @@ def generate_captcha():
     return f"{a} + {b}", a + b
 
 # ================= START =================
-
 @router.message(Command("start"))
 async def start(msg: types.Message):
     args = msg.text.split()
@@ -126,11 +116,11 @@ async def start(msg: types.Message):
 3️⃣ CAPTCHA Solve করো  
 
 ⬇️ শুরু করতে বাটন চাপো""",
+        parse_mode="HTML",
         reply_markup=verify_keyboard()
     )
 
 # ================= VERIFY =================
-
 @router.callback_query(lambda c: c.data == "verify")
 async def verify(call: types.CallbackQuery):
     if not await check_channels(call.from_user.id):
@@ -144,11 +134,10 @@ async def verify(call: types.CallbackQuery):
     )
     db.commit()
 
-    await call.message.answer(f"🧩 CAPTCHA Solve করো:\n<b>{question}</b>")
+    await call.message.answer(f"🧩 CAPTCHA Solve করো:\n<b>{question}</b>", parse_mode="HTML")
     await call.answer()
 
 # ================= CAPTCHA ANSWER =================
-
 @router.message()
 async def captcha_handler(msg: types.Message):
     cursor.execute(
@@ -188,26 +177,22 @@ async def captcha_handler(msg: types.Message):
         await msg.answer("❌ ভুল উত্তর, আবার চেষ্টা করো")
 
 # ================= BALANCE =================
-
 @router.callback_query(lambda c: c.data == "balance")
 async def balance(call: types.CallbackQuery):
     cursor.execute("SELECT balance FROM users WHERE user_id=?", (call.from_user.id,))
     bal = cursor.fetchone()[0]
-
-    await call.message.answer(f"💰 <b>Your Balance</b>\n\n{bal} {TOKEN_NAME}")
+    await call.message.answer(f"💰 <b>Your Balance</b>\n\n{bal} {TOKEN_NAME}", parse_mode="HTML")
     await call.answer()
 
 # ================= REFER LINK =================
-
 @router.callback_query(lambda c: c.data == "refer")
 async def refer(call: types.CallbackQuery):
     me = await bot.get_me()
     link = f"https://t.me/{me.username}?start={call.from_user.id}"
-    await call.message.answer(f"🔗 <b>Your Referral Link</b>\n<code>{link}</code>")
+    await call.message.answer(f"🔗 <b>Your Referral Link</b>\n<code>{link}</code>", parse_mode="HTML")
     await call.answer()
 
 # ================= WITHDRAW =================
-
 @router.callback_query(lambda c: c.data == "withdraw")
 async def withdraw(call: types.CallbackQuery):
     cursor.execute("SELECT balance FROM users WHERE user_id=?", (call.from_user.id,))
@@ -234,12 +219,12 @@ Amount: {bal}
 Tax: {tax}
 Net Payable: {net}
 
-⏳ Processing..."""
+⏳ Processing...""",
+        parse_mode="HTML"
     )
     await call.answer()
 
 # ================= RUN =================
-
 async def main():
     await dp.start_polling(bot)
 
