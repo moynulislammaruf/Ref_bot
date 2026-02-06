@@ -231,4 +231,20 @@ async def withdraw(call: CallbackQuery):
     db.commit()
 
     await call.message.answer(
-        f"""
+        f"""💸 <b>Withdraw Requested</b>
+
+Amount: {bal}
+Tax: {tax}
+Net Payable: {net}
+
+⏳ Processing..."""
+    )
+    await call.answer()
+
+# ================= RUN =================
+
+async def main():
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
