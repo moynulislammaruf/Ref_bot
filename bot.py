@@ -26,7 +26,7 @@ MANDATORY_CHANNELS = [
 
 # ==================================================
 
-bot = Bot(8508138633:AAE6NRVSAXXrkzFCA8DLRJb389xroV2HqCA, parse_mode=ParseMode.HTML)
+bot = Bot("8508138633:AAE6NRVSAXXrkzFCA8DLRJb389xroV2HqCA", parse_mode=ParseMode.HTML)
 dp = Dispatcher()
 router = Router()
 dp.include_router(router)
