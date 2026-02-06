@@ -9,7 +9,9 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 # ================= CONFIG SECTION =================
 
-BOT_TOKEN = "8508138633:AAE6NRVSAXXrkzFCA8DLRJb389xroV2HqCA"
+import os
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_IDS = [5988572342]  # তোমার Telegram ID বসাও
 
 TOKEN_NAME = "STAR"
