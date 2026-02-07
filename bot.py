@@ -2,17 +2,21 @@ import os
 import json
 import asyncio
 import random
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 import aiosqlite
 from dotenv import load_dotenv
 
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.filters import CommandStart, Command
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import (
+    Message, CallbackQuery,
+    InlineKeyboardMarkup, InlineKeyboardButton
+)
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+
 
 # =========================
 # Config
@@ -30,6 +34,7 @@ if not MASTER_FORCE_JOIN_CHANNEL:
     raise RuntimeError("MASTER_FORCE_JOIN_CHANNEL missing")
 if not MASTER_ADMINS:
     raise RuntimeError("MASTER_ADMINS missing")
+
 
 # =========================
 # DB
@@ -49,13 +54,43 @@ CREATE TABLE IF NOT EXISTS tenants (
 
 CREATE TABLE IF NOT EXISTS tenant_settings (
   tenant_id INTEGER PRIMARY KEY,
+
+  -- bot status
+  bot_on INTEGER NOT NULL DEFAULT 1,
+  maintenance_on INTEGER NOT NULL DEFAULT 0,
+
+  -- captcha / verification
+  captcha_on INTEGER NOT NULL DEFAULT 1,
+
+  -- channels
+  joining_channels TEXT NOT NULL DEFAULT '[]', -- JSON list
+  check_channels   TEXT NOT NULL DEFAULT '[]', -- JSON list
+
+  -- economics
   currency TEXT NOT NULL DEFAULT 'POINTS',
   reward_per_ref INTEGER NOT NULL DEFAULT 1,
-  min_withdraw INTEGER NOT NULL DEFAULT 10,
-  required_channels TEXT NOT NULL DEFAULT '[]', -- JSON list
+
+  -- withdraw
+  withdraw_on INTEGER NOT NULL DEFAULT 1,
+  withdraw_confirmation_on INTEGER NOT NULL DEFAULT 0,
+  min_withdraw REAL NOT NULL DEFAULT 10,
+  max_withdraw REAL NOT NULL DEFAULT 1000000,
+  withdraw_tax REAL NOT NULL DEFAULT 0,
+
+  -- payout
   payout_mode TEXT NOT NULL DEFAULT 'manual',   -- manual|xrocket
   xrocket_api_key TEXT,
+
+  -- texts
+  home_text TEXT NOT NULL DEFAULT '🎉 Welcome!',
+
   FOREIGN KEY(tenant_id) REFERENCES tenants(id)
+);
+
+CREATE TABLE IF NOT EXISTS tenant_admins (
+  tenant_id INTEGER NOT NULL,
+  user_id INTEGER NOT NULL,
+  PRIMARY KEY (tenant_id, user_id)
 );
 
 CREATE TABLE IF NOT EXISTS users (
@@ -64,9 +99,10 @@ CREATE TABLE IF NOT EXISTS users (
   referrer_user_id INTEGER,
   joined_ok INTEGER NOT NULL DEFAULT 0,
   captcha_ok INTEGER NOT NULL DEFAULT 0,
-  ref_applied INTEGER NOT NULL DEFAULT 0, -- important for idempotency
+  ref_applied INTEGER NOT NULL DEFAULT 0,
   referrals_count INTEGER NOT NULL DEFAULT 0,
-  balance INTEGER NOT NULL DEFAULT 0,
+  balance REAL NOT NULL DEFAULT 0,
+  is_banned INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   PRIMARY KEY (tenant_id, user_id)
 );
@@ -84,11 +120,20 @@ CREATE TABLE IF NOT EXISTS payouts (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   tenant_id INTEGER NOT NULL,
   user_id INTEGER NOT NULL,
-  amount INTEGER NOT NULL,
-  method TEXT NOT NULL,
-  status TEXT NOT NULL,
+  amount REAL NOT NULL,
+  method TEXT NOT NULL,         -- manual|xrocket
+  status TEXT NOT NULL,         -- requested|paid|rejected
   details TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS admin_state (
+  tenant_id INTEGER NOT NULL,
+  user_id INTEGER NOT NULL,
+  action TEXT NOT NULL,
+  payload TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  PRIMARY KEY (tenant_id, user_id)
 );
 """
 
@@ -114,49 +159,116 @@ async def exec_sql(sql: str, params=()):
         await db.execute(sql, params)
         await db.commit()
 
+
 # =========================
 # Keyboards
 # =========================
 def kb_master_home():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="➕ নতুন Bot রেজিস্টার", callback_data="m:new_bot")],
-        [InlineKeyboardButton(text="📦 আমার Bot লিস্ট", callback_data="m:list_bots")],
+        [InlineKeyboardButton(text="➕ Create Bot", callback_data="m:new_bot")],
+        [InlineKeyboardButton(text="📦 My Bots", callback_data="m:list_bots")],
         [InlineKeyboardButton(text="ℹ️ Help", callback_data="m:help")],
     ])
 
-def kb_tenant_admin_home(plan: str):
-    rows = [
-        [InlineKeyboardButton(text="⚙️ Settings (View)", callback_data="t:settings")],
-        [InlineKeyboardButton(text="📣 Channels (View)", callback_data="t:channels")],
-        [InlineKeyboardButton(text="🎁 Reward (View)", callback_data="t:reward")],
-        [InlineKeyboardButton(text="💸 Payout (View)", callback_data="t:payout")],
-        [InlineKeyboardButton(text="📊 Stats", callback_data="t:stats")],
-    ]
-    # later: add edit flows; plan gating can be applied here
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
 def kb_user_main():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="👥 আমার রেফার", callback_data="u:refs")],
-        [InlineKeyboardButton(text="💰 ব্যালান্স", callback_data="u:bal")],
-        [InlineKeyboardButton(text="🏧 Withdraw", callback_data="u:wd")],
+        [InlineKeyboardButton(text="💰 BALANCE", callback_data="u:bal"),
+         InlineKeyboardButton(text="👥 MY TEAM", callback_data="u:refs")],
+        [InlineKeyboardButton(text="🔗 REFER", callback_data="u:link"),
+         InlineKeyboardButton(text="🎁 BONUS", callback_data="u:bonus")],
+        [InlineKeyboardButton(text="🏧 WITHDRAW", callback_data="u:wd"),
+         InlineKeyboardButton(text="📊 STATISTICS", callback_data="u:stats")],
     ])
+
+def kb_join_check(channels: list[str]):
+    rows = []
+    for ch in channels:
+        rows.append([InlineKeyboardButton(text=f"🔗 {ch}", url=f"https://t.me/{ch.lstrip('@')}")])
+    rows.append([InlineKeyboardButton(text="✅ Check", callback_data="u:check_join")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+def kb_tenant_admin_panel(s: dict, is_owner: bool):
+    # mimic “toggle” panel
+    def onoff(v: int) -> str:
+        return "✅" if int(v) == 1 else "❌"
+    def ena(v: int) -> str:
+        return "✅ ENABLE" if int(v) == 1 else "❌ DISABLE"
+
+    # You can reorder to match your screenshot style
+    rows = [
+        [InlineKeyboardButton(text=f"Bot Status ~ {ena(s['bot_on'])}", callback_data="a:toggle_bot"),
+         InlineKeyboardButton(text=f"Maintenance ~ {ena(1-int(s['maintenance_on']))}".replace("ENABLE","DISABLE") if s['maintenance_on'] else f"Maintenance ~ {ena(1)}", callback_data="a:toggle_maint")],
+
+        [InlineKeyboardButton(text=f"Withdraw Status ~ {ena(s['withdraw_on'])}", callback_data="a:toggle_withdraw"),
+         InlineKeyboardButton(text=f"Withdraw Confirm ~ {onoff(s['withdraw_confirmation_on'])}", callback_data="a:toggle_wdconf")],
+
+        [InlineKeyboardButton(text="Set Minimum Withdraw", callback_data="a:set_minwd"),
+         InlineKeyboardButton(text="Set Maximum Withdraw", callback_data="a:set_maxwd")],
+
+        [InlineKeyboardButton(text="Set Withdraw Tax", callback_data="a:set_tax"),
+         InlineKeyboardButton(text="Set Per Refer", callback_data="a:set_reward")],
+
+        [InlineKeyboardButton(text="Set Payout Currency", callback_data="a:set_currency"),
+         InlineKeyboardButton(text="Set Bot Currency (alias)", callback_data="a:set_currency")],
+
+        [InlineKeyboardButton(text="Set Joining Channel", callback_data="a:add_join_ch"),
+         InlineKeyboardButton(text="Remove Joining Channel", callback_data="a:rm_join_ch")],
+
+        [InlineKeyboardButton(text="Set Check Channel", callback_data="a:add_check_ch"),
+         InlineKeyboardButton(text="Remove Check Channel", callback_data="a:rm_check_ch")],
+
+        [InlineKeyboardButton(text=f"Captcha Verification ~ {ena(s['captcha_on'])}", callback_data="a:toggle_captcha"),
+         InlineKeyboardButton(text="Broadcast", callback_data="a:broadcast")],
+
+        [InlineKeyboardButton(text="Find User Details", callback_data="a:find_user"),
+         InlineKeyboardButton(text="Withdraw Requests", callback_data="a:wd_list")],
+
+        [InlineKeyboardButton(text="Ban User", callback_data="a:ban_user"),
+         InlineKeyboardButton(text="Unban User", callback_data="a:unban_user")],
+
+        [InlineKeyboardButton(text="Add Balance", callback_data="a:add_balance"),
+         InlineKeyboardButton(text="Remove Balance", callback_data="a:rm_balance")],
+    ]
+
+    # owner-only controls
+    if is_owner:
+        rows.append([
+            InlineKeyboardButton(text="Add Admin", callback_data="a:add_admin"),
+            InlineKeyboardButton(text="Remove Admin", callback_data="a:rm_admin"),
+        ])
+        rows.append([
+            InlineKeyboardButton(text="Get Admin List", callback_data="a:list_admins"),
+            InlineKeyboardButton(text="Check Ban List", callback_data="a:list_bans"),
+        ])
+        rows.append([
+            InlineKeyboardButton(text="Set API Key (xRocket)", callback_data="a:set_xrocket"),
+            InlineKeyboardButton(text="Set Home Text", callback_data="a:set_home"),
+        ])
+        rows.append([
+            InlineKeyboardButton(text="Toggle Payout Mode (manual/xrocket)", callback_data="a:toggle_payoutmode")
+        ])
+
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+def kb_withdraw_request_actions(payout_id: int):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Approve (Paid)", callback_data=f"wd:approve:{payout_id}"),
+         InlineKeyboardButton(text="❌ Reject", callback_data=f"wd:reject:{payout_id}")]
+    ])
+
 
 # =========================
 # Tenant runtime manager
 # =========================
 class TenantRuntime:
     def __init__(self):
-        self.tasks: Dict[int, asyncio.Task] = {}   # tenant_id -> task
+        self.tasks: Dict[int, asyncio.Task] = {}
 
     async def start_tenant(self, tenant_id: int, bot_token: str):
         if tenant_id in self.tasks and not self.tasks[tenant_id].done():
             return
 
-        bot = Bot(
-            token=bot_token,
-            default=DefaultBotProperties(parse_mode=ParseMode.HTML)
-        )
+        bot = Bot(token=bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
         dp = Dispatcher()
         dp.include_router(build_tenant_router(tenant_id))
 
@@ -165,17 +277,13 @@ class TenantRuntime:
 
         self.tasks[tenant_id] = asyncio.create_task(runner())
 
-    async def stop_tenant(self, tenant_id: int):
-        t = self.tasks.get(tenant_id)
-        if t and not t.done():
-            t.cancel()
-
 tenant_runtime = TenantRuntime()
 
+
 # =========================
-# Shared helpers
+# Helpers
 # =========================
-def make_captcha():
+def make_captcha() -> Tuple[str, str]:
     a = random.randint(2, 9)
     b = random.randint(2, 9)
     return f"{a} + {b} = ?", str(a + b)
@@ -186,30 +294,65 @@ async def get_settings(tenant_id: int) -> dict:
         await exec_sql("INSERT INTO tenant_settings(tenant_id) VALUES(?)", (tenant_id,))
         row = await q_one("SELECT * FROM tenant_settings WHERE tenant_id=?", (tenant_id,))
     s = dict(row)
-    s["required_channels"] = json.loads(s["required_channels"])
+    s["joining_channels"] = json.loads(s["joining_channels"])
+    s["check_channels"] = json.loads(s["check_channels"])
     return s
+
+async def set_settings_json_list(tenant_id: int, field: str, value: list[str]):
+    await exec_sql(
+        f"UPDATE tenant_settings SET {field}=? WHERE tenant_id=?",
+        (json.dumps(value, ensure_ascii=False), tenant_id)
+    )
 
 async def ensure_user(tenant_id: int, user_id: int):
     row = await q_one("SELECT 1 FROM users WHERE tenant_id=? AND user_id=?", (tenant_id, user_id))
     if not row:
         await exec_sql("INSERT INTO users(tenant_id,user_id) VALUES(?,?)", (tenant_id, user_id))
 
-async def check_force_join(bot: Bot, user_id: int, channels: list[str]) -> bool:
+async def is_admin(tenant_id: int, user_id: int) -> Tuple[bool, bool]:
+    t = await q_one("SELECT owner_user_id FROM tenants WHERE id=?", (tenant_id,))
+    if not t:
+        return False, False
+    if int(t["owner_user_id"]) == int(user_id):
+        return True, True
+    a = await q_one("SELECT 1 FROM tenant_admins WHERE tenant_id=? AND user_id=?", (tenant_id, user_id))
+    return (a is not None), False
+
+async def check_join(bot: Bot, user_id: int, channels: list[str]) -> bool:
+    # requires bot to be admin in those channels in many cases
     for ch in channels:
         try:
-            member = await bot.get_chat_member(chat_id=ch, user_id=user_id)
-            if member.status in ("left", "kicked"):
+            m = await bot.get_chat_member(chat_id=ch, user_id=user_id)
+            if m.status in ("left", "kicked"):
                 return False
         except TelegramBadRequest:
-            # usually means bot can't check membership (not admin or invalid channel)
             return False
     return True
+
+async def set_admin_state(tenant_id: int, user_id: int, action: str, payload: str = ""):
+    await exec_sql(
+        "INSERT OR REPLACE INTO admin_state(tenant_id,user_id,action,payload) VALUES(?,?,?,?)",
+        (tenant_id, user_id, action, payload)
+    )
+
+async def pop_admin_state(tenant_id: int, user_id: int) -> Tuple[Optional[str], str]:
+    row = await q_one("SELECT action, payload FROM admin_state WHERE tenant_id=? AND user_id=?",
+                      (tenant_id, user_id))
+    if row:
+        await exec_sql("DELETE FROM admin_state WHERE tenant_id=? AND user_id=?",
+                       (tenant_id, user_id))
+        return row["action"], (row["payload"] or "")
+    return None, ""
 
 async def apply_referral_if_ready(tenant_id: int, new_user_id: int):
     u = await q_one("SELECT * FROM users WHERE tenant_id=? AND user_id=?", (tenant_id, new_user_id))
     if not u:
         return
-    if u["joined_ok"] != 1 or u["captcha_ok"] != 1:
+    if int(u["is_banned"]) == 1:
+        return
+    if u["joined_ok"] != 1:
+        return
+    if u["captcha_ok"] != 1:
         return
     if not u["referrer_user_id"]:
         return
@@ -217,91 +360,267 @@ async def apply_referral_if_ready(tenant_id: int, new_user_id: int):
         return
 
     s = await get_settings(tenant_id)
-    reward = int(s["reward_per_ref"])
+    reward = float(s["reward_per_ref"])
     referrer_id = int(u["referrer_user_id"])
 
-    # mark applied first (idempotency)
+    # mark applied
     await exec_sql(
         "UPDATE users SET ref_applied=1 WHERE tenant_id=? AND user_id=?",
         (tenant_id, new_user_id)
     )
+    # credit referrer
     await exec_sql(
         "UPDATE users SET referrals_count=referrals_count+1, balance=balance+? "
         "WHERE tenant_id=? AND user_id=?",
         (reward, tenant_id, referrer_id)
     )
 
+
 # =========================
-# Tenant bot router
+# Tenant Router (child bot)
 # =========================
 def build_tenant_router(tenant_id: int) -> Router:
     r = Router()
 
+    @r.message(Command("adminpanel"))
     @r.message(Command("admin"))
-    async def tenant_admin(message: Message):
-        t = await q_one("SELECT owner_user_id, plan FROM tenants WHERE id=?", (tenant_id,))
-        if not t or message.from_user.id != t["owner_user_id"]:
-            return await message.answer("❌ আপনি এই বটের admin নন।")
-        await message.answer(
-            f"✅ Tenant Admin Panel\nPlan: <b>{t['plan']}</b>",
-            reply_markup=kb_tenant_admin_home(t["plan"])
+    async def open_admin_panel(message: Message):
+        admin_ok, is_owner = await is_admin(tenant_id, message.from_user.id)
+        if not admin_ok:
+            return await message.answer("❌ You are not admin.")
+        s = await get_settings(tenant_id)
+        panel_text = (
+            "✅ <b>WELCOME TO ADMIN PANEL</b>\n\n"
+            f"Bot ON/OFF: {'ON' if s['bot_on'] else 'OFF'}\n"
+            f"Maintenance: {'ON' if s['maintenance_on'] else 'OFF'}\n"
+            f"Withdraw: {'ON' if s['withdraw_on'] else 'OFF'}\n"
+            f"Captcha: {'ON' if s['captcha_on'] else 'OFF'}\n"
+            f"Per Refer: {s['reward_per_ref']} {s['currency']}\n"
+            f"Min Withdraw: {s['min_withdraw']}\n"
+            f"Max Withdraw: {s['max_withdraw']}\n"
+            f"Withdraw Tax: {s['withdraw_tax']}\n"
+            f"Payout Mode: {s['payout_mode']}\n"
         )
+        await message.answer(panel_text, reply_markup=kb_tenant_admin_panel(s, is_owner))
 
-    @r.callback_query(F.data.startswith("t:"))
-    async def tenant_admin_callbacks(call: CallbackQuery):
-        t = await q_one("SELECT owner_user_id, plan FROM tenants WHERE id=?", (tenant_id,))
-        if not t or call.from_user.id != t["owner_user_id"]:
-            await call.answer("Not admin", show_alert=True)
-            return
-
+    @r.callback_query(F.data.startswith("a:"))
+    async def admin_actions(call: CallbackQuery):
+        admin_ok, is_owner = await is_admin(tenant_id, call.from_user.id)
+        if not admin_ok:
+            return await call.answer("Not admin", show_alert=True)
         s = await get_settings(tenant_id)
 
-        if call.data == "t:settings":
-            await call.message.answer(
-                "⚙️ Settings (View)\n"
-                f"Currency: <b>{s['currency']}</b>\n"
-                f"Reward per ref: <b>{s['reward_per_ref']}</b>\n"
-                f"Min withdraw: <b>{s['min_withdraw']}</b>\n"
-                f"Payout mode: <b>{s['payout_mode']}</b>\n"
+        def refresh_text(ss: dict) -> str:
+            return (
+                "✅ <b>WELCOME TO ADMIN PANEL</b>\n\n"
+                f"Bot ON/OFF: {'ON' if ss['bot_on'] else 'OFF'}\n"
+                f"Maintenance: {'ON' if ss['maintenance_on'] else 'OFF'}\n"
+                f"Withdraw: {'ON' if ss['withdraw_on'] else 'OFF'}\n"
+                f"Captcha: {'ON' if ss['captcha_on'] else 'OFF'}\n"
+                f"Per Refer: {ss['reward_per_ref']} {ss['currency']}\n"
+                f"Min Withdraw: {ss['min_withdraw']}\n"
+                f"Max Withdraw: {ss['max_withdraw']}\n"
+                f"Withdraw Tax: {ss['withdraw_tax']}\n"
+                f"Payout Mode: {ss['payout_mode']}\n"
             )
-        elif call.data == "t:channels":
-            ch = s["required_channels"]
-            text = "\n".join([f"• {x}" for x in ch]) if ch else "(none)"
-            await call.message.answer("📣 Required channels (View)\n" + text)
-        elif call.data == "t:reward":
-            await call.message.answer(
-                "🎁 Reward (View)\n"
-                f"Reward per ref: <b>{s['reward_per_ref']}</b> {s['currency']}"
-            )
-        elif call.data == "t:payout":
-            await call.message.answer(
-                "💸 Payout (View)\n"
-                f"Mode: <b>{s['payout_mode']}</b>\n"
-                "MVP এ withdraw request শুধু 'requested' হিসেবে সেভ হয়।"
-            )
-        elif call.data == "t:stats":
-            rows = await q_one(
-                "SELECT COUNT(*) AS users FROM users WHERE tenant_id=?",
+
+        action = call.data
+
+        # toggles
+        if action == "a:toggle_bot":
+            await exec_sql("UPDATE tenant_settings SET bot_on=1-bot_on WHERE tenant_id=?", (tenant_id,))
+        elif action == "a:toggle_maint":
+            await exec_sql("UPDATE tenant_settings SET maintenance_on=1-maintenance_on WHERE tenant_id=?", (tenant_id,))
+        elif action == "a:toggle_captcha":
+            await exec_sql("UPDATE tenant_settings SET captcha_on=1-captcha_on WHERE tenant_id=?", (tenant_id,))
+        elif action == "a:toggle_withdraw":
+            await exec_sql("UPDATE tenant_settings SET withdraw_on=1-withdraw_on WHERE tenant_id=?", (tenant_id,))
+        elif action == "a:toggle_wdconf":
+            await exec_sql("UPDATE tenant_settings SET withdraw_confirmation_on=1-withdraw_confirmation_on WHERE tenant_id=?", (tenant_id,))
+        elif action == "a:toggle_payoutmode":
+            if not is_owner:
+                return await call.answer("Owner only", show_alert=True)
+            new_mode = "xrocket" if s["payout_mode"] == "manual" else "manual"
+            await exec_sql("UPDATE tenant_settings SET payout_mode=? WHERE tenant_id=?", (new_mode, tenant_id))
+            await call.message.answer(f"✅ Payout mode set: <b>{new_mode}</b>")
+
+        # setters (wizard)
+        elif action == "a:set_minwd":
+            await set_admin_state(tenant_id, call.from_user.id, "set_minwd")
+            await call.message.answer("Send minimum withdraw amount (number).")
+        elif action == "a:set_maxwd":
+            await set_admin_state(tenant_id, call.from_user.id, "set_maxwd")
+            await call.message.answer("Send maximum withdraw amount (number).")
+        elif action == "a:set_tax":
+            await set_admin_state(tenant_id, call.from_user.id, "set_tax")
+            await call.message.answer("Send withdraw tax amount (number).")
+        elif action == "a:set_reward":
+            await set_admin_state(tenant_id, call.from_user.id, "set_reward")
+            await call.message.answer("Send reward per refer (number).")
+        elif action == "a:set_currency":
+            await set_admin_state(tenant_id, call.from_user.id, "set_currency")
+            await call.message.answer("Send currency text (e.g. USDT / POINTS).")
+
+        elif action == "a:add_join_ch":
+            await set_admin_state(tenant_id, call.from_user.id, "add_join_ch")
+            await call.message.answer("Send channel username to ADD in Joining Channels (example: @mychannel).")
+        elif action == "a:rm_join_ch":
+            await set_admin_state(tenant_id, call.from_user.id, "rm_join_ch")
+            await call.message.answer("Send channel username to REMOVE from Joining Channels (example: @mychannel).")
+        elif action == "a:add_check_ch":
+            await set_admin_state(tenant_id, call.from_user.id, "add_check_ch")
+            await call.message.answer("Send channel username to ADD in Check Channels (example: @mychannel).")
+        elif action == "a:rm_check_ch":
+            await set_admin_state(tenant_id, call.from_user.id, "rm_check_ch")
+            await call.message.answer("Send channel username to REMOVE from Check Channels (example: @mychannel).")
+
+        elif action == "a:broadcast":
+            await set_admin_state(tenant_id, call.from_user.id, "broadcast")
+            await call.message.answer("Send broadcast text now (will be sent to all users).")
+
+        elif action == "a:find_user":
+            await set_admin_state(tenant_id, call.from_user.id, "find_user")
+            await call.message.answer("Send user_id to find details.")
+        elif action == "a:ban_user":
+            await set_admin_state(tenant_id, call.from_user.id, "ban_user")
+            await call.message.answer("Send user_id to BAN.")
+        elif action == "a:unban_user":
+            await set_admin_state(tenant_id, call.from_user.id, "unban_user")
+            await call.message.answer("Send user_id to UNBAN.")
+        elif action == "a:add_balance":
+            await set_admin_state(tenant_id, call.from_user.id, "add_balance")
+            await call.message.answer("Send: user_id amount  (example: 123456789 10)")
+        elif action == "a:rm_balance":
+            await set_admin_state(tenant_id, call.from_user.id, "rm_balance")
+            await call.message.answer("Send: user_id amount  (example: 123456789 10)")
+
+        elif action == "a:add_admin":
+            if not is_owner:
+                return await call.answer("Owner only", show_alert=True)
+            await set_admin_state(tenant_id, call.from_user.id, "add_admin")
+            await call.message.answer("Send user_id to ADD as admin.")
+        elif action == "a:rm_admin":
+            if not is_owner:
+                return await call.answer("Owner only", show_alert=True)
+            await set_admin_state(tenant_id, call.from_user.id, "rm_admin")
+            await call.message.answer("Send user_id to REMOVE admin.")
+        elif action == "a:list_admins":
+            if not is_owner:
+                return await call.answer("Owner only", show_alert=True)
+            rows = await q_all("SELECT user_id FROM tenant_admins WHERE tenant_id=?", (tenant_id,))
+            lst = "\n".join([str(r["user_id"]) for r in rows]) or "(none)"
+            await call.message.answer("👮 Admin list:\n" + lst)
+        elif action == "a:list_bans":
+            if not is_owner:
+                return await call.answer("Owner only", show_alert=True)
+            rows = await q_all("SELECT user_id FROM users WHERE tenant_id=? AND is_banned=1", (tenant_id,))
+            lst = "\n".join([str(r["user_id"]) for r in rows]) or "(none)"
+            await call.message.answer("🚫 Banned users:\n" + lst)
+
+        elif action == "a:set_xrocket":
+            if not is_owner:
+                return await call.answer("Owner only", show_alert=True)
+            await set_admin_state(tenant_id, call.from_user.id, "set_xrocket")
+            await call.message.answer("Send xRocket API key.")
+        elif action == "a:set_home":
+            if not is_owner:
+                return await call.answer("Owner only", show_alert=True)
+            await set_admin_state(tenant_id, call.from_user.id, "set_home")
+            await call.message.answer("Send new home text for /start (users).")
+
+        elif action == "a:wd_list":
+            # show recent withdraw requests
+            rows = await q_all(
+                "SELECT id, user_id, amount, method, status, created_at FROM payouts "
+                "WHERE tenant_id=? ORDER BY id DESC LIMIT 10",
                 (tenant_id,)
             )
-            req = await q_one(
-                "SELECT COUNT(*) AS wreq FROM payouts WHERE tenant_id=? AND status='requested'",
-                (tenant_id,)
-            )
-            await call.message.answer(
-                "📊 Stats\n"
-                f"Users: <b>{rows['users'] if rows else 0}</b>\n"
-                f"Withdraw requests: <b>{req['wreq'] if req else 0}</b>\n"
-            )
+            if not rows:
+                await call.message.answer("No withdraw requests yet.")
+            else:
+                for rrow in rows:
+                    txt = (
+                        f"🏧 <b>Withdraw Request</b>\n"
+                        f"ID: <code>{rrow['id']}</code>\n"
+                        f"User: <code>{rrow['user_id']}</code>\n"
+                        f"Amount: <b>{rrow['amount']}</b>\n"
+                        f"Method: <b>{rrow['method']}</b>\n"
+                        f"Status: <b>{rrow['status']}</b>\n"
+                        f"At: {rrow['created_at']}"
+                    )
+                    if rrow["status"] == "requested":
+                        await call.message.answer(txt, reply_markup=kb_withdraw_request_actions(int(rrow["id"])))
+                    else:
+                        await call.message.answer(txt)
+
+        # refresh panel message (best effort)
+        try:
+            ss = await get_settings(tenant_id)
+            await call.message.edit_text(refresh_text(ss), reply_markup=kb_tenant_admin_panel(ss, is_owner))
+        except:
+            pass
 
         await call.answer()
 
+    @r.callback_query(F.data.startswith("wd:"))
+    async def withdraw_moderation(call: CallbackQuery):
+        admin_ok, _is_owner = await is_admin(tenant_id, call.from_user.id)
+        if not admin_ok:
+            return await call.answer("Not admin", show_alert=True)
+
+        parts = call.data.split(":")
+        if len(parts) != 3:
+            return await call.answer("Bad action", show_alert=True)
+        action, payout_id = parts[1], int(parts[2])
+
+        row = await q_one(
+            "SELECT id, user_id, amount, status FROM payouts WHERE tenant_id=? AND id=?",
+            (tenant_id, payout_id)
+        )
+        if not row:
+            return await call.answer("Not found", show_alert=True)
+        if row["status"] != "requested":
+            return await call.answer("Already processed", show_alert=True)
+
+        if action == "approve":
+            await exec_sql(
+                "UPDATE payouts SET status='paid' WHERE tenant_id=? AND id=?",
+                (tenant_id, payout_id)
+            )
+            await call.message.answer(f"✅ Marked as PAID. (ID: {payout_id})")
+        elif action == "reject":
+            # refund back to user balance
+            await exec_sql(
+                "UPDATE payouts SET status='rejected' WHERE tenant_id=? AND id=?",
+                (tenant_id, payout_id)
+            )
+            await exec_sql(
+                "UPDATE users SET balance=balance+? WHERE tenant_id=? AND user_id=?",
+                (float(row["amount"]), tenant_id, int(row["user_id"]))
+            )
+            await call.message.answer(f"❌ Rejected + refunded. (ID: {payout_id})")
+
+        await call.answer("Done")
+
     @r.message(CommandStart())
     async def start(message: Message):
-        await ensure_user(tenant_id, message.from_user.id)
         s = await get_settings(tenant_id)
 
-        # referral: /start ref_123
+        # bot OFF
+        if int(s["bot_on"]) != 1:
+            return await message.answer("❌ Bot is currently OFF.")
+        # maintenance
+        if int(s["maintenance_on"]) == 1:
+            return await message.answer("🛠 Bot is under maintenance. Please try later.")
+
+        await ensure_user(tenant_id, message.from_user.id)
+
+        # banned?
+        u0 = await q_one("SELECT is_banned FROM users WHERE tenant_id=? AND user_id=?", (tenant_id, message.from_user.id))
+        if u0 and int(u0["is_banned"]) == 1:
+            return await message.answer("🚫 You are banned.")
+
+        # referral param: /start ref_123
         referrer = None
         parts = (message.text or "").split(maxsplit=1)
         if len(parts) == 2 and parts[1].startswith("ref_"):
@@ -310,7 +629,6 @@ def build_tenant_router(tenant_id: int) -> Router:
             except:
                 referrer = None
 
-        # store referrer if first time and not self
         if referrer and referrer != message.from_user.id:
             existing = await q_one(
                 "SELECT referrer_user_id FROM users WHERE tenant_id=? AND user_id=?",
@@ -322,109 +640,257 @@ def build_tenant_router(tenant_id: int) -> Router:
                     (referrer, tenant_id, message.from_user.id)
                 )
 
-        # tenant force-join
-        ok = await check_force_join(message.bot, message.from_user.id, s["required_channels"])
-        if not ok:
-            ch_list = "\n".join([f"• {c}" for c in s["required_channels"]]) or "• (কোনো চ্যানেল সেট করা নেই)"
+        # Joining channels enforcement
+        join_ok = await check_join(message.bot, message.from_user.id, s["joining_channels"])
+        if not join_ok and s["joining_channels"]:
+            await exec_sql("UPDATE users SET joined_ok=0 WHERE tenant_id=? AND user_id=?",
+                           (tenant_id, message.from_user.id))
             return await message.answer(
-                "✅ বট ব্যবহার করতে আগে নিচের চ্যানেলগুলোতে Join করুন, তারপর আবার /start দিন:\n"
-                f"{ch_list}\n\n"
-                "⚠️ নোট: বটকে ওই চ্যানেলগুলোতে admin না করলে verify ব্যর্থ হতে পারে।"
+                "⚠️ You Need To Join Channels Before Using This Bot!",
+                reply_markup=kb_join_check(s["joining_channels"])
             )
 
-        await exec_sql(
-            "UPDATE users SET joined_ok=1 WHERE tenant_id=? AND user_id=?",
-            (tenant_id, message.from_user.id)
-        )
+        await exec_sql("UPDATE users SET joined_ok=1 WHERE tenant_id=? AND user_id=?",
+                       (tenant_id, message.from_user.id))
 
-        # captcha
-        u = await q_one(
-            "SELECT captcha_ok FROM users WHERE tenant_id=? AND user_id=?",
-            (tenant_id, message.from_user.id)
-        )
-        if u and u["captcha_ok"] != 1:
+        # Captcha if enabled
+        u = await q_one("SELECT captcha_ok FROM users WHERE tenant_id=? AND user_id=?",
+                        (tenant_id, message.from_user.id))
+        if int(s["captcha_on"]) == 1 and u and u["captcha_ok"] != 1:
             q, ans = make_captcha()
             await exec_sql(
                 "INSERT OR REPLACE INTO captcha_state(tenant_id,user_id,question,answer) VALUES(?,?,?,?)",
                 (tenant_id, message.from_user.id, q, ans)
             )
-            return await message.answer(f"🧩 Captcha: <b>{q}</b>\nউত্তর লিখুন:")
+            return await message.answer(f"🧩 Captcha: <b>{q}</b>\nSend answer:")
 
-        return await message.answer("🎉 Welcome!\nরেফার লিংক পেতে: /link", reply_markup=kb_user_main())
+        # show home
+        await message.answer(s["home_text"], reply_markup=kb_user_main())
+
+    @r.callback_query(F.data == "u:check_join")
+    async def user_check_join(call: CallbackQuery):
+        s = await get_settings(tenant_id)
+        ok = await check_join(call.bot, call.from_user.id, s["joining_channels"])
+        if not ok:
+            return await call.answer("Not joined yet", show_alert=True)
+        await exec_sql("UPDATE users SET joined_ok=1 WHERE tenant_id=? AND user_id=?",
+                       (tenant_id, call.from_user.id))
+        await call.message.answer("✅ Joined verified. Now send /start again.")
+        await call.answer()
 
     @r.message(F.text)
-    async def text_handler(message: Message):
-        # captcha answer
-        st = await q_one(
-            "SELECT * FROM captcha_state WHERE tenant_id=? AND user_id=?",
-            (tenant_id, message.from_user.id)
-        )
+    async def text_router(message: Message):
+        s = await get_settings(tenant_id)
+
+        # 1) Admin wizard input
+        admin_ok, is_owner = await is_admin(tenant_id, message.from_user.id)
+        if admin_ok:
+            action, payload = await pop_admin_state(tenant_id, message.from_user.id)
+            if action:
+                txt = (message.text or "").strip()
+
+                try:
+                    if action == "set_minwd":
+                        v = float(txt); await exec_sql("UPDATE tenant_settings SET min_withdraw=? WHERE tenant_id=?", (v, tenant_id))
+                        return await message.answer(f"✅ Min withdraw set: {v}")
+                    if action == "set_maxwd":
+                        v = float(txt); await exec_sql("UPDATE tenant_settings SET max_withdraw=? WHERE tenant_id=?", (v, tenant_id))
+                        return await message.answer(f"✅ Max withdraw set: {v}")
+                    if action == "set_tax":
+                        v = float(txt); await exec_sql("UPDATE tenant_settings SET withdraw_tax=? WHERE tenant_id=?", (v, tenant_id))
+                        return await message.answer(f"✅ Withdraw tax set: {v}")
+                    if action == "set_reward":
+                        v = float(txt); await exec_sql("UPDATE tenant_settings SET reward_per_ref=? WHERE tenant_id=?", (v, tenant_id))
+                        return await message.answer(f"✅ Reward per refer set: {v}")
+                    if action == "set_currency":
+                        if len(txt) > 20: return await message.answer("❌ Too long. Max 20 chars.")
+                        await exec_sql("UPDATE tenant_settings SET currency=? WHERE tenant_id=?", (txt, tenant_id))
+                        return await message.answer(f"✅ Currency set: {txt}")
+
+                    if action in ("add_join_ch", "rm_join_ch", "add_check_ch", "rm_check_ch"):
+                        if not txt.startswith("@"):
+                            return await message.answer("❌ Send channel like @channelusername")
+                        field = "joining_channels" if "join" in action else "check_channels"
+                        lst = s[field].copy()
+                        if action.startswith("add_"):
+                            if txt not in lst:
+                                lst.append(txt)
+                            await set_settings_json_list(tenant_id, field, lst)
+                            return await message.answer(f"✅ Added to {field}: {txt}")
+                        else:
+                            if txt in lst:
+                                lst.remove(txt)
+                            await set_settings_json_list(tenant_id, field, lst)
+                            return await message.answer(f"✅ Removed from {field}: {txt}")
+
+                    if action == "broadcast":
+                        # send to all users (best effort)
+                        users = await q_all("SELECT user_id FROM users WHERE tenant_id=? AND is_banned=0", (tenant_id,))
+                        okc = 0
+                        for ur in users:
+                            try:
+                                await message.bot.send_message(int(ur["user_id"]), txt)
+                                okc += 1
+                            except:
+                                pass
+                        return await message.answer(f"✅ Broadcast done. Delivered: {okc}/{len(users)}")
+
+                    if action == "find_user":
+                        uid = int(txt)
+                        u = await q_one("SELECT * FROM users WHERE tenant_id=? AND user_id=?", (tenant_id, uid))
+                        if not u:
+                            return await message.answer("Not found.")
+                        return await message.answer(
+                            "👤 User Details\n"
+                            f"ID: <code>{u['user_id']}</code>\n"
+                            f"Balance: <b>{u['balance']}</b>\n"
+                            f"Refs: <b>{u['referrals_count']}</b>\n"
+                            f"Banned: <b>{u['is_banned']}</b>\n"
+                            f"Referrer: <code>{u['referrer_user_id']}</code>\n"
+                        )
+
+                    if action in ("ban_user", "unban_user"):
+                        uid = int(txt)
+                        v = 1 if action == "ban_user" else 0
+                        await exec_sql("UPDATE users SET is_banned=? WHERE tenant_id=? AND user_id=?", (v, tenant_id, uid))
+                        return await message.answer(f"✅ {'BANNED' if v==1 else 'UNBANNED'}: {uid}")
+
+                    if action in ("add_balance", "rm_balance"):
+                        parts = txt.split()
+                        if len(parts) != 2:
+                            return await message.answer("❌ Send: user_id amount (example: 123 10)")
+                        uid = int(parts[0]); amt = float(parts[1])
+                        if amt < 0:
+                            return await message.answer("❌ amount must be positive")
+                        sign = 1 if action == "add_balance" else -1
+                        await exec_sql(
+                            "UPDATE users SET balance=balance+? WHERE tenant_id=? AND user_id=?",
+                            (sign*amt, tenant_id, uid)
+                        )
+                        return await message.answer(f"✅ Balance updated: {uid} ({'+' if sign==1 else '-'}{amt})")
+
+                    if action == "add_admin":
+                        if not is_owner:
+                            return await message.answer("Owner only.")
+                        uid = int(txt)
+                        await exec_sql("INSERT OR IGNORE INTO tenant_admins(tenant_id,user_id) VALUES(?,?)", (tenant_id, uid))
+                        return await message.answer(f"✅ Admin added: {uid}")
+
+                    if action == "rm_admin":
+                        if not is_owner:
+                            return await message.answer("Owner only.")
+                        uid = int(txt)
+                        await exec_sql("DELETE FROM tenant_admins WHERE tenant_id=? AND user_id=?", (tenant_id, uid))
+                        return await message.answer(f"✅ Admin removed: {uid}")
+
+                    if action == "set_xrocket":
+                        if not is_owner:
+                            return await message.answer("Owner only.")
+                        await exec_sql("UPDATE tenant_settings SET xrocket_api_key=? WHERE tenant_id=?", (txt, tenant_id))
+                        return await message.answer("✅ xRocket API key saved.")
+
+                    if action == "set_home":
+                        if not is_owner:
+                            return await message.answer("Owner only.")
+                        await exec_sql("UPDATE tenant_settings SET home_text=? WHERE tenant_id=?", (txt, tenant_id))
+                        return await message.answer("✅ Home text updated.")
+
+                except ValueError:
+                    return await message.answer("❌ Invalid number format.")
+                except Exception:
+                    return await message.answer("❌ Failed. Try again.")
+
+        # 2) Captcha answer (for normal users)
+        st = await q_one("SELECT * FROM captcha_state WHERE tenant_id=? AND user_id=?",
+                         (tenant_id, message.from_user.id))
         if st:
             ans = (message.text or "").strip()
             if ans == st["answer"]:
-                await exec_sql(
-                    "DELETE FROM captcha_state WHERE tenant_id=? AND user_id=?",
-                    (tenant_id, message.from_user.id)
-                )
-                await exec_sql(
-                    "UPDATE users SET captcha_ok=1 WHERE tenant_id=? AND user_id=?",
-                    (tenant_id, message.from_user.id)
-                )
+                await exec_sql("DELETE FROM captcha_state WHERE tenant_id=? AND user_id=?",
+                               (tenant_id, message.from_user.id))
+                await exec_sql("UPDATE users SET captcha_ok=1 WHERE tenant_id=? AND user_id=?",
+                               (tenant_id, message.from_user.id))
                 await apply_referral_if_ready(tenant_id, message.from_user.id)
-                return await message.answer("✅ Captcha OK! এখন /link বা মেনু ব্যবহার করুন।", reply_markup=kb_user_main())
-            return await message.answer("❌ ভুল উত্তর। আবার চেষ্টা করুন:")
+                s2 = await get_settings(tenant_id)
+                return await message.answer("✅ Captcha OK! Send /start again.", reply_markup=None)
+            return await message.answer("❌ Wrong captcha. Try again:")
 
-    @r.message(Command("link"))
-    async def link(message: Message):
-        me = await message.bot.get_me()
-        link = f"https://t.me/{me.username}?start=ref_{message.from_user.id}"
-        await message.answer(f"🔗 আপনার রেফার লিংক:\n{link}")
-
+    # User callbacks
     @r.callback_query(F.data == "u:bal")
-    async def cb_bal(call: CallbackQuery):
+    async def u_bal(call: CallbackQuery):
         s = await get_settings(tenant_id)
-        u = await q_one(
-            "SELECT balance FROM users WHERE tenant_id=? AND user_id=?",
-            (tenant_id, call.from_user.id)
-        )
-        bal = int(u["balance"]) if u else 0
+        u = await q_one("SELECT balance FROM users WHERE tenant_id=? AND user_id=?", (tenant_id, call.from_user.id))
+        bal = float(u["balance"]) if u else 0.0
         await call.message.answer(f"💰 Balance: <b>{bal}</b> {s['currency']}")
         await call.answer()
 
     @r.callback_query(F.data == "u:refs")
-    async def cb_refs(call: CallbackQuery):
-        u = await q_one(
-            "SELECT referrals_count FROM users WHERE tenant_id=? AND user_id=?",
-            (tenant_id, call.from_user.id)
-        )
+    async def u_refs(call: CallbackQuery):
+        u = await q_one("SELECT referrals_count FROM users WHERE tenant_id=? AND user_id=?", (tenant_id, call.from_user.id))
         cnt = int(u["referrals_count"]) if u else 0
         await call.message.answer(f"👥 Total referrals: <b>{cnt}</b>")
         await call.answer()
 
+    @r.callback_query(F.data == "u:link")
+    async def u_link(call: CallbackQuery):
+        me = await call.bot.get_me()
+        link = f"https://t.me/{me.username}?start=ref_{call.from_user.id}"
+        await call.message.answer(f"🔗 Your refer link:\n{link}")
+        await call.answer()
+
+    @r.callback_query(F.data == "u:bonus")
+    async def u_bonus(call: CallbackQuery):
+        await call.message.answer("🎁 Bonus feature not configured in this build.")
+        await call.answer()
+
+    @r.callback_query(F.data == "u:stats")
+    async def u_stats(call: CallbackQuery):
+        rows = await q_one("SELECT COUNT(*) AS users FROM users WHERE tenant_id=?", (tenant_id,))
+        await call.message.answer(f"📊 Total users: <b>{rows['users'] if rows else 0}</b>")
+        await call.answer()
+
     @r.callback_query(F.data == "u:wd")
-    async def cb_wd(call: CallbackQuery):
+    async def u_withdraw(call: CallbackQuery):
         s = await get_settings(tenant_id)
-        u = await q_one(
-            "SELECT balance FROM users WHERE tenant_id=? AND user_id=?",
-            (tenant_id, call.from_user.id)
-        )
-        bal = int(u["balance"]) if u else 0
-        if bal < int(s["min_withdraw"]):
-            await call.message.answer(f"❌ মিনিমাম withdraw: {s['min_withdraw']} {s['currency']}")
+
+        if int(s["withdraw_on"]) != 1:
+            await call.message.answer("❌ Withdraw is disabled.")
             return await call.answer()
 
+        u = await q_one("SELECT balance FROM users WHERE tenant_id=? AND user_id=?", (tenant_id, call.from_user.id))
+        bal = float(u["balance"]) if u else 0.0
+
+        if bal < float(s["min_withdraw"]):
+            await call.message.answer(f"❌ Minimum withdraw: {s['min_withdraw']} {s['currency']}")
+            return await call.answer()
+
+        if bal > float(s["max_withdraw"]):
+            await call.message.answer(f"❌ Maximum withdraw: {s['max_withdraw']} {s['currency']}")
+            return await call.answer()
+
+        tax = float(s["withdraw_tax"])
+        net = max(0.0, bal - tax)
+
+        # confirmation toggle
+        if int(s["withdraw_confirmation_on"]) == 1:
+            await call.message.answer(
+                f"⚠️ Confirm withdraw?\nAmount: {bal}\nTax: {tax}\nNet: {net}\n\nSend /start then press withdraw again to proceed."
+            )
+            return await call.answer()
+
+        # create payout request
         await exec_sql(
             "INSERT INTO payouts(tenant_id,user_id,amount,method,status) VALUES(?,?,?,?,?)",
-            (tenant_id, call.from_user.id, bal, s["payout_mode"], "requested")
+            (tenant_id, call.from_user.id, net, s["payout_mode"], "requested")
         )
-        await exec_sql(
-            "UPDATE users SET balance=0 WHERE tenant_id=? AND user_id=?",
-            (tenant_id, call.from_user.id)
-        )
-        await call.message.answer("✅ Withdraw request নেওয়া হয়েছে। Admin যাচাই করে পেমেন্ট করবে।")
+        await exec_sql("UPDATE users SET balance=0 WHERE tenant_id=? AND user_id=?",
+                       (tenant_id, call.from_user.id))
+
+        await call.message.answer("✅ Withdraw request submitted. Admin will process it.")
         await call.answer()
 
     return r
+
 
 # =========================
 # Master bot router
@@ -443,20 +909,19 @@ async def master_start(message: Message):
     ok = await is_joined_master(message.bot, message.from_user.id)
     if not ok:
         return await message.answer(
-            f"❗ Master panel ব্যবহার করতে আগে Join করুন: {MASTER_FORCE_JOIN_CHANNEL}\n"
-            f"Join করে আবার /start দিন।"
+            f"❗ Join required: {MASTER_FORCE_JOIN_CHANNEL}\nThen send /start again."
         )
     await message.answer("🧠 Referral Master Panel", reply_markup=kb_master_home())
 
 @master_router.callback_query(F.data == "m:help")
 async def m_help(call: CallbackQuery):
     await call.message.answer(
-        "✅ কীভাবে কাজ করে:\n"
-        "1) BotFather থেকে নতুন bot বানিয়ে token নিন\n"
-        "2) ‘নতুন Bot রেজিস্টার’ এ token দিন\n"
-        "3) আপনার bot চালু হবে (এই সার্ভারেই)\n"
-        "4) আপনার bot-এ গিয়ে /admin দিন\n\n"
-        "⚠️ Channel verify করতে child bot-কে required channel-এ admin করতে হতে পারে।"
+        "How it works:\n"
+        "1) Create a bot in BotFather\n"
+        "2) Send token here\n"
+        "3) Your bot starts on this server\n"
+        "4) Open your bot and send /adminpanel\n\n"
+        "Note: Channel verification works best if the tenant bot is admin in required channels."
     )
     await call.answer()
 
@@ -467,7 +932,7 @@ async def m_list(call: CallbackQuery):
         (call.from_user.id,)
     )
     if not rows:
-        await call.message.answer("আপনার কোনো bot রেজিস্টার করা নেই।")
+        await call.message.answer("No bots registered.")
         return await call.answer()
 
     lines = []
@@ -478,30 +943,24 @@ async def m_list(call: CallbackQuery):
 
 @master_router.callback_query(F.data == "m:new_bot")
 async def m_newbot(call: CallbackQuery):
-    await call.message.answer(
-        "BotFather থেকে token কপি করে এই চ্যাটে পাঠান (123456:ABC...)\n"
-        "⚠️ Token দিলে এই সার্ভার ওই বট চালাবে।"
-    )
+    await call.message.answer("Send BotFather token here (format: 123456:ABC...).")
     await call.answer()
 
 @master_router.message(F.text)
-async def master_text(message: Message):
-    text = (message.text or "").strip()
-
-    # quick token heuristic
-    if ":" not in text or len(text) < 30:
+async def master_token_receive(message: Message):
+    txt = (message.text or "").strip()
+    if ":" not in txt or len(txt) < 30:
         return
 
     ok = await is_joined_master(message.bot, message.from_user.id)
     if not ok:
-        return await message.answer(f"আগে Join করুন: {MASTER_FORCE_JOIN_CHANNEL}")
+        return await message.answer(f"Join required: {MASTER_FORCE_JOIN_CHANNEL}")
 
-    token = text
+    token = txt
 
-    # already registered?
-    existing = await q_one("SELECT id FROM tenants WHERE bot_token=?", (token,))
-    if existing:
-        return await message.answer("❌ এই token আগেই রেজিস্টার করা আছে।")
+    exists = await q_one("SELECT id FROM tenants WHERE bot_token=?", (token,))
+    if exists:
+        return await message.answer("❌ Token already registered.")
 
     # insert tenant
     await exec_sql(
@@ -511,22 +970,19 @@ async def master_text(message: Message):
     t = await q_one("SELECT id FROM tenants WHERE bot_token=?", (token,))
     tenant_id = int(t["id"])
 
-    # try to read username
+    # fetch username
     temp_bot = Bot(token=token)
     try:
         me = await temp_bot.get_me()
         await exec_sql("UPDATE tenants SET bot_username=? WHERE id=?", (me.username, tenant_id))
-        await message.answer(
-            f"✅ Bot রেজিস্টার সফল: @{me.username}\n"
-            f"এখন ওই বটে গিয়ে /admin দিন।"
-        )
+        await message.answer(f"✅ Registered: @{me.username}\nOpen that bot and send /adminpanel")
     except Exception:
-        await message.answer("✅ Bot রেজিস্টার হয়েছে, কিন্তু username পড়া যায়নি।")
+        await message.answer("✅ Registered, but failed to read bot username.")
     finally:
         await temp_bot.session.close()
 
-    # start tenant runner
     await tenant_runtime.start_tenant(tenant_id, token)
+
 
 # =========================
 # App main
@@ -534,20 +990,20 @@ async def master_text(message: Message):
 async def main():
     await init_db()
 
-    # start all active tenants on boot
+    # start all active tenants
     tenants = await q_all("SELECT id, bot_token FROM tenants WHERE is_active=1")
     for t in tenants:
         await tenant_runtime.start_tenant(int(t["id"]), t["bot_token"])
 
-    # start master bot polling
-    master_bot = Bot(
+    # start master
+    bot = Bot(
         token=MASTER_BOT_TOKEN,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML)
     )
     dp = Dispatcher()
     dp.include_router(master_router)
 
-    await dp.start_polling(master_bot, allowed_updates=dp.resolve_used_update_types())
+    await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
 
 if __name__ == "__main__":
     asyncio.run(main())
